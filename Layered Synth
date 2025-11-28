@@ -1,0 +1,253 @@
+import tkinter as tk
+from tkinter import ttk, filedialog
+import numpy as np
+import pyaudio
+import threading
+import wave 
+
+# --- 1. CONFIG ---
+SAMPLE_RATE = 44100
+BLOCK_SIZE = 1024 
+MAX_GAIN = 0.15 
+
+# --- 2. AUDIO CLASSES ---
+class QuantumOscillator:
+    def __init__(self, sample_rate=SAMPLE_RATE):
+        self.sample_rate = sample_rate
+        self.base_freq = 110.0
+        
+        # The Three States of Schrödinger
+        self.freq_1 = 110.0
+        self.freq_2 = 110.0
+        self.freq_3 = 110.0
+        
+        self._phase_1 = 0.0
+        self._phase_2 = 0.0
+        self._phase_3 = 0.0
+        
+        # The Multipliers (Ratios)
+        self.ratio_2 = 10.0 # User example: 10x
+        self.ratio_3 = 5.5  # User example: 5.5x
+
+    def set_midi_note(self, midi_note):
+        # Calculate Base Frequency (Root)
+        self.base_freq = 440.0 * (2.0**((midi_note - 69.0) / 12.0))
+        
+        # Calculate the Quantum Superpositions
+        self.freq_1 = self.base_freq            # The Funk Bass
+        self.freq_2 = self.base_freq * self.ratio_2 # The "100Hz" layer
+        self.freq_3 = self.base_freq * self.ratio_3 # The "55Hz" layer
+        
+    def generate_block(self, num_samples=BLOCK_SIZE):
+        t = np.arange(num_samples) / self.sample_rate
+        
+        # --- GENERATE LAYER 1 (Rick James Funk Base) ---
+        p1 = 2.0 * np.pi * self.freq_1 * t + self._phase_1
+        self._phase_1 = p1[-1] % (2.0 * np.pi)
+        # Mix of Saw + Square
+        sig1 = (0.6 * (((p1 % (2*np.pi))/(2*np.pi))*2.0-1.0)) + (0.4 * np.sign(np.sin(p1)))
+
+        # --- GENERATE LAYER 2 (The High Harmonic) ---
+        p2 = 2.0 * np.pi * self.freq_2 * t + self._phase_2
+        self._phase_2 = p2[-1] % (2.0 * np.pi)
+        sig2 = np.sin(p2) # Sine wave for the "Ghost" sound
+
+        # --- GENERATE LAYER 3 (The Complimentary Harmonic) ---
+        p3 = 2.0 * np.pi * self.freq_3 * t + self._phase_3
+        self._phase_3 = p3[-1] % (2.0 * np.pi)
+        sig3 = ((p3 % (2*np.pi))/(2*np.pi))*2.0-1.0 # Sawtooth for texture
+
+        # --- COLLAPSE THE WAVEFUNCTION (Mix them) ---
+        # 50% Bass, 25% Harmonic A, 25% Harmonic B
+        mixed_signal = (sig1 * 0.5) + (sig2 * 0.25) + (sig3 * 0.25)
+        
+        return mixed_signal
+
+class ADSR:
+    def __init__(self, sample_rate=SAMPLE_RATE):
+        self.sample_rate = sample_rate
+        self.A, self.D, self.S, self.R = 0.01, 0.2, 0.5, 0.2
+        self.state = 'idle'; self._level = 0.0
+    def note_on(self, p):
+        self.A=p.get('attack',0.01); self.D=p.get('decay',0.2); self.S=p.get('sustain',0.5); self.R=p.get('release',0.2)
+        self.state = 'attack'
+    def note_off(self): 
+        if self.state!='idle': self.state='release'
+    def process_block(self, n=BLOCK_SIZE):
+        o=np.zeros(n); dt=1.0/self.sample_rate; c=self._level
+        for i in range(n):
+            if self.state=='attack':
+                c+=dt/self.A if self.A>0 else 1.0
+                if c>=1.0: c=1.0; self.state='decay'
+            elif self.state=='decay':
+                c-=((1.0-self.S)*dt)/self.D if self.D>0 else 0.0
+                if c<=self.S: c=self.S; self.state='sustain'
+            elif self.state=='sustain': c=self.S
+            elif self.state=='release':
+                c-=(c*dt)/self.R if self.R>0 else 1.0
+                if c<=0.0: c=0.0; self.state='idle'
+            o[i]=c; self._level=c
+        return o
+
+class MoogFilter:
+    def __init__(self, sample_rate=SAMPLE_RATE):
+        self.sample_rate = sample_rate
+        self.cutoff = 3000.0; self.resonance = 0.5; self.env_amt = 2000.0
+        self.y1=self.y2=self.y3=self.y4=self.oldx=self.oldy1=self.oldy2=self.oldy3=0.0
+    def process_block(self, audio_in, env_in):
+        out = np.zeros_like(audio_in)
+        for i in range(len(audio_in)):
+            c_cut = np.clip(self.cutoff + (env_in[i] * self.env_amt), 50, 18000)
+            f = 2.0 * c_cut / self.sample_rate; k = 3.6*f - 1.6*f*f - 1.0 
+            p = (k+1.0)*0.5; scale = np.exp((1.0-p)*1.386249); r = self.resonance*scale
+            x = audio_in[i] - r*self.y4
+            self.y1=x*p + self.oldx*p - k*self.y1
+            self.y2=self.y1*p + self.oldy1*p - k*self.y2
+            self.y3=self.y2*p + self.oldy2*p - k*self.y3
+            self.y4=self.y3*p + self.oldy3*p - k*self.y4
+            self.y4 = self.y4 - (self.y4**3)/6.0
+            self.oldx=x; self.oldy1=self.y1; self.oldy2=self.y2; self.oldy3=self.y3
+            out[i] = self.y4
+        return out
+
+class Voice:
+    def __init__(self, midi_note, params):
+        self.osc = QuantumOscillator(SAMPLE_RATE)
+        # Apply the Quantum Ratios
+        self.osc.ratio_2 = params.get('ratio_2', 10.0)
+        self.osc.ratio_3 = params.get('ratio_3', 5.5)
+        
+        self.amp_env = ADSR(SAMPLE_RATE)
+        self.filter_env = ADSR(SAMPLE_RATE)
+        
+        self.osc.set_midi_note(midi_note)
+        self.amp_env.note_on(params)
+        self.filter_env.note_on(params)
+
+    def generate_block(self, num_samples):
+        raw = self.osc.generate_block(num_samples)
+        amp = self.amp_env.process_block(num_samples)
+        f_env = self.filter_env.process_block(num_samples)
+        return raw, amp, f_env, (self.amp_env.state == 'idle')
+
+# --- 3. ENGINE ---
+class SchrodingerEngine:
+    def __init__(self):
+        self.active_voice = None
+        self.lock = threading.Lock()
+        self.filter = MoogFilter(SAMPLE_RATE)
+        self.is_recording = False; self.record_buffer = []
+        
+        self.params = {
+            'master_volume': MAX_GAIN,
+            'cutoff': 500.0, 'resonance': 0.6, 'env_amt': 3000.0,
+            'attack': 0.01, 'decay': 0.2, 'sustain': 0.5, 'release': 0.2,
+            # THE QUANTUM VARIABLES
+            'ratio_2': 10.0, 
+            'ratio_3': 5.5
+        }
+        
+        p = pyaudio.PyAudio()
+        self.stream = p.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE, output=True, frames_per_buffer=BLOCK_SIZE, stream_callback=self._callback)
+
+    def note_on(self, midi_note):
+        with self.lock:
+            self.active_voice = Voice(midi_note, self.params)
+
+    def note_off(self, midi_note):
+        with self.lock:
+            if self.active_voice: 
+                self.active_voice.amp_env.note_off()
+                self.active_voice.filter_env.note_off()
+
+    def update_param(self, name, value):
+        self.params[name] = float(value)
+        if name in ['cutoff','resonance','env_amt']: setattr(self.filter, name, float(value))
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        out = np.zeros(frame_count, dtype=np.float32)
+        with self.lock:
+            if self.active_voice:
+                osc, amp, f_env, done = self.active_voice.generate_block(frame_count)
+                filtered = self.filter.process_block(osc, f_env)
+                out += filtered * amp
+                if done: self.active_voice = None
+        
+        out = np.clip(out, -1.0, 1.0) * self.params['master_volume']
+        if self.is_recording: self.record_buffer.append(out.copy())
+        return (out.tobytes(), pyaudio.paContinue)
+
+    def start_recording(self): self.record_buffer=[]; self.is_recording=True
+    def stop_recording(self): self.is_recording=False
+    def save_recording(self,f):
+        if not self.record_buffer: return
+        d=(np.concatenate(self.record_buffer)*32767).clip(-32767,32767).astype(np.int16)
+        with wave.open(f,'wb') as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(SAMPLE_RATE); w.writeframes(d.tobytes())
+    def close(self): self.stream.stop_stream(); self.stream.close()
+
+# --- 4. UI ---
+class SchrodingerUI(tk.Tk):
+    def __init__(self, synth):
+        super().__init__()
+        self.synth = synth
+        self.title("SCHRÖDINGER'S KEYBOARD")
+        self.geometry("900x1200")
+        self.configure(bg='black')
+        
+        style = ttk.Style(); style.theme_use('clam')
+        style.configure('.', background='black', foreground='white', font=('Arial', 24))
+        style.configure('TScale', background='black', troughcolor='#004400', sliderrelief='flat')
+        style.configure('Record.TButton', foreground='white', background='#008800', borderwidth=0) 
+        
+        canvas = tk.Canvas(self, bg='black', highlightthickness=0); canvas.pack(side="left", fill="both", expand=True)
+        frame = ttk.Frame(canvas, style='TFrame'); canvas.create_window((0, 0), window=frame, anchor="nw")
+        
+        self.idx=0
+        # RECORD
+        self.rec_var = tk.StringVar(value="RECORD QUANTUM STATE")
+        ttk.Button(frame, textvariable=self.rec_var, command=self._rec, style='Record.TButton').grid(row=0, column=0, columnspan=2, sticky='ew', padx=20, pady=20); self.idx+=1
+        
+        # QUANTUM RATIOS
+        self._head(frame, "QUANTUM MULTIPLIERS")
+        # Default 10.0 (User's request)
+        self._scl(frame, "ratio_2", "Sound 2 Ratio (Default 10x)", 1.0, 20.0, 10.0)
+        # Default 5.5 (User's request)
+        self._scl(frame, "ratio_3", "Sound 3 Ratio (Default 5.5x)", 1.0, 20.0, 5.5)
+
+        # FUNK BASE
+        self._head(frame, "RICK JAMES BASE (FILTER)")
+        self._scl(frame, "cutoff", "Brightness", 50, 5000, 500)
+        self._scl(frame, "env_amt", "Snap Amount", 0, 5000, 3000)
+        
+        self._head(frame, "ENVELOPE")
+        self._scl(frame, "decay", "Decay Speed", 0.05, 1.0, 0.2)
+
+        ttk.Label(frame, text="Use Keys A-K").grid(row=100, columnspan=2, pady=30)
+        self.bind_all('<KeyPress>', self._on); self.bind_all('<KeyRelease>', self._off)
+        self.keys = {}; self.map = {'a':36,'w':37,'s':38,'e':39,'d':40,'f':41,'t':42,'g':43,'y':44,'h':45,'u':46,'j':47}
+
+    def _head(self,p,t): ttk.Label(p, text=f"-- {t} --", foreground='#00ff00').grid(row=self.idx, column=0, pady=20); self.idx+=1
+    def _scl(self,p,param,txt,f,t,d):
+        ttk.Label(p, text=txt).grid(row=self.idx, column=0, sticky='w', padx=20)
+        ttk.Scale(p, from_=f, to=t, value=d, length=400, command=lambda v: self.synth.update_param(param,v)).grid(row=self.idx, column=1, padx=20); self.idx+=1
+    def _rec(self):
+        if not self.synth.is_recording: self.synth.start_recording(); self.rec_var.set("COLLAPSE WAVEFUNCTION (STOP)")
+        else:
+            self.synth.stop_recording(); self.rec_var.set("RECORD QUANTUM STATE")
+            fn = filedialog.asksaveasfilename(defaultextension=".wav"); 
+            if fn: self.synth.save_recording(fn)
+    def _on(self,e): 
+        k=e.keysym.lower()
+        if k in self.map and k not in self.keys: self.synth.note_on(self.map[k]); self.keys[k]=True
+    def _off(self,e):
+        k=e.keysym.lower()
+        if k in self.map: 
+             if k in self.keys: del self.keys[k]
+             if not self.keys: self.synth.note_off(self.map[k]) 
+
+if __name__ == '__main__':
+    s = SchrodingerEngine()
+    app = SchrodingerUI(s)
+    try: app.mainloop()
+    finally: s.close()
+    
