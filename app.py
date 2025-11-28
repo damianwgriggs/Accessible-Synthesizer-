@@ -1,8 +1,10 @@
 import tkinter as tk
-from tkinter import ttk, Scale, OptionMenu
+from tkinter import ttk, Scale, OptionMenu, filedialog, messagebox
 import numpy as np
 import pyaudio
-import threading 
+import threading
+import wave  # ### NEW: Required for saving WAV files
+import struct # ### NEW: Required for binary data packing
 
 # --- 1. GLOBAL CONSTANTS ---
 SAMPLE_RATE = 44100
@@ -158,6 +160,10 @@ class ClaritySynthesizer:
         self.global_vcf = VCF(SAMPLE_RATE)
         self.is_running = True
         
+        # ### NEW: Recording State
+        self.is_recording = False
+        self.record_buffer = [] # Stores numpy blocks
+        
         self.params = {
             'master_volume': MAX_GAIN,
             'waveform': 'sine',
@@ -186,7 +192,6 @@ class ClaritySynthesizer:
         with self.voice_lock: 
             if midi_note not in self.active_voices:
                 if len(self.active_voices) >= self.MAX_POLYPHONY:
-                    # print("Polyphony limit reached. Ignoring Note On.")
                     return
 
                 new_voice = Voice(midi_note, self.params)
@@ -217,6 +222,38 @@ class ClaritySynthesizer:
                 if name in ['coarse_tune', 'fine_tune']:
                      voice.vco.set_midi_note(midi_note)
 
+    # ### NEW: Recording Controls
+    def start_recording(self):
+        self.record_buffer = []
+        self.is_recording = True
+        print("Recording Started...")
+
+    def stop_recording(self):
+        self.is_recording = False
+        print(f"Recording Stopped. Captured {len(self.record_buffer)} blocks.")
+    
+    def save_recording(self, filename):
+        if not self.record_buffer:
+            return False
+            
+        try:
+            # Combine all numpy blocks into one large array
+            full_audio = np.concatenate(self.record_buffer)
+            
+            # Convert 32-bit float (-1.0 to 1.0) to 16-bit PCM integer (-32767 to 32767)
+            # This ensures compatibility with all standard media players
+            audio_int16 = (full_audio * 32767).clip(-32767, 32767).astype(np.int16)
+            
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(1) # Mono
+                wf.setsampwidth(2) # 2 bytes = 16 bit
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio_int16.tobytes())
+            return True
+        except Exception as e:
+            print(f"Error saving file: {e}")
+            return False
+
     def _audio_callback(self, in_data, frame_count, time_info, status):
         output_block = np.zeros(frame_count, dtype=np.float32)
         voices_to_remove = []
@@ -241,6 +278,11 @@ class ClaritySynthesizer:
         master_gain = self.params.get('master_volume', MAX_GAIN)
         output_block = np.clip(output_block, -1.0, 1.0) * master_gain
         
+        # ### NEW: Capture audio if recording
+        # We capture the float array before conversion to bytes for processing
+        if self.is_recording:
+            self.record_buffer.append(output_block.copy())
+
         return (output_block.astype(np.float32).tobytes(), pyaudio.paContinue)
 
     def close(self):
@@ -271,27 +313,27 @@ class ClarityUI(tk.Tk):
         style.configure('TLabel', background='black', foreground='white', font=LARGE_FONT)
         style.configure('TFrame', background='black')
         style.configure('TScale', background='black', foreground='white', troughcolor='#333333')
-        style.configure('TButton', background='#333333', foreground='white', font=LARGE_FONT)
+        style.configure('TButton', background='#333333', foreground='white', font=LARGE_FONT, borderwidth=5)
         style.configure('TMenubutton', background='black', foreground='white', font=LARGE_FONT)
 
         style.configure('Focused.TScale', background='black', foreground='white', troughcolor='yellow')
+        
+        # Styles for Record Button
+        style.configure('Record.TButton', foreground='red', background='#220000')
+        style.configure('Stop.TButton', foreground='yellow', background='#222200')
 
         # ------------------------------------------------------------------
-        # ⚠️ SCROLLING IMPLEMENTATION START ⚠️
+        # SCROLLING IMPLEMENTATION
         # ------------------------------------------------------------------
         
-        # 1. Create a Main Canvas
         canvas = tk.Canvas(self, bg='black', highlightthickness=0)
         canvas.pack(side="left", fill="both", expand=True)
 
-        # 2. Create a Vertical Scrollbar and link it to the Canvas
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         scrollbar.pack(side="right", fill="y")
 
-        # 3. Configure the Canvas to use the Scrollbar
         canvas.configure(yscrollcommand=scrollbar.set)
         
-        # 4. Create the Scrollable Frame (All widgets go inside this frame)
         scrollable_frame = ttk.Frame(canvas, padding="30 30 30 30")
         scrollable_frame.bind(
             "<Configure>",
@@ -299,12 +341,10 @@ class ClarityUI(tk.Tk):
                 scrollregion=canvas.bbox("all")
             )
         )
-        scrollable_frame.bind("<MouseWheel>", self._on_mousewheel) # Enable mousewheel scroll
+        scrollable_frame.bind("<MouseWheel>", self._on_mousewheel) 
         
-        # 5. Put the Scrollable Frame inside the Canvas window
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         
-        # 6. Ensure the canvas expands the frame width
         scrollable_frame.bind(
             "<Enter>",
             lambda e: canvas.bind_all('<Key-Down>', self._on_arrow_key_scroll),
@@ -313,22 +353,21 @@ class ClarityUI(tk.Tk):
             "<Leave>",
             lambda e: canvas.unbind_all('<Key-Down>'),
         )
-        
-        # ------------------------------------------------------------------
-        # ⚠️ SCROLLING IMPLEMENTATION END ⚠️
-        # ------------------------------------------------------------------
 
-
-        # --- Keyboard Bindings for Note Input ---
+        # --- Keyboard Bindings ---
         self.bind_all('<KeyPress>', self._handle_key_press)
         self.bind_all('<KeyRelease>', self._handle_key_release)
         self.pressed_keys = set()
 
-        # --- Build Single-Column Parameter Layout (using scrollable_frame) ---
+        # --- Build Layout ---
         self._row_counter = 0
 
         # Master Section
         self._add_section_header(scrollable_frame, "Master Controls")
+        
+        # ### NEW: Add Record Button in Master Section
+        self._add_record_controls(scrollable_frame)
+        
         self._add_scale_control(scrollable_frame, "master_volume", "Volume", 0.0, MAX_GAIN, MAX_GAIN, 0.01)
 
         # VCO Section
@@ -355,16 +394,57 @@ class ClarityUI(tk.Tk):
                       row=self._row_counter, column=0, columnspan=2, pady=30, sticky='ew')
         self._row_counter += 1
         
-        self.canvas = canvas # Store canvas for scrolling methods
+        self.canvas = canvas 
+
+    # ### NEW: Record Button Helper
+    def _add_record_controls(self, parent):
+        self.record_btn_var = tk.StringVar(value="RECORD")
+        
+        self.record_btn = ttk.Button(
+            parent, 
+            textvariable=self.record_btn_var, 
+            command=self._toggle_record,
+            style='Record.TButton'
+        )
+        self.record_btn.grid(row=self._row_counter, column=0, columnspan=2, sticky='ew', padx=15, pady=20)
+        self._row_counter += 1
+
+    # ### NEW: Record Toggle Logic
+    def _toggle_record(self):
+        if not self.synth.is_recording:
+            # Start Recording
+            self.synth.start_recording()
+            self.record_btn_var.set("STOP & SAVE")
+            self.record_btn.configure(style='Stop.TButton')
+            print("Announcement: Recording started.")
+        else:
+            # Stop Recording
+            self.synth.stop_recording()
+            self.record_btn_var.set("RECORD")
+            self.record_btn.configure(style='Record.TButton')
+            
+            # Open File Dialog
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".wav",
+                filetypes=[("WAV files", "*.wav")],
+                title="Save Recording"
+            )
+            
+            if filename:
+                success = self.synth.save_recording(filename)
+                if success:
+                    print(f"Announcement: Saved to {filename}")
+                else:
+                    print("Announcement: Error saving file.")
+            else:
+                print("Announcement: Save cancelled.")
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         
     def _on_arrow_key_scroll(self, event):
-        # Scrolls down by a unit when down arrow is pressed outside of a focused widget
         if self.focus_get() == self.canvas:
              self.canvas.yview_scroll(1, "units")
-
 
     def _add_section_header(self, parent, text):
         ttk.Label(parent, text=f"--- {text} ---", foreground='yellow', font=('Arial', 32, 'bold')).grid(
@@ -423,7 +503,6 @@ class ClarityUI(tk.Tk):
                 print(f"Note On: {key} (MIDI {midi_note})")
                 self.pressed_keys.add(key)
         
-        # Screen reader announcements
         if event.keysym == 'Return' and self.focus_get():
             try:
                 widget = self.focus_get()
