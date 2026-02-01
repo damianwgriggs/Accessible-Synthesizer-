@@ -1,539 +1,266 @@
-import tkinter as tk
-from tkinter import ttk, Scale, OptionMenu, filedialog, messagebox
 import numpy as np
-import pyaudio
-import threading
-import wave  # ### NEW: Required for saving WAV files
-import struct # ### NEW: Required for binary data packing
+import wave
+import json
+import collections
+import secrets  # Cryptographic strength entropy
+import datetime
+import random
+from openai import OpenAI
 
-# --- 1. GLOBAL CONSTANTS ---
+# --- 1. STUDIO CONFIGURATION ---
 SAMPLE_RATE = 44100
-BLOCK_SIZE = 512
-MAX_GAIN = 0.2
-KEY_MAP = {
-    'a': 60, 'w': 61, 's': 62, 'e': 63, 'd': 64, 'f': 65,
-    't': 66, 'g': 67, 'y': 68, 'h': 69, 'u': 70, 'j': 71, 
-    'k': 72, 
-}
+BPM = 118  # "Mid-Tempo" Cyberpunk
+BARS_TO_RENDER = 16 
 
-# --- 2. SYNTH COMPONENT CLASSES (VCO, ADSR, VCF) ---
-class VCO:
-    def __init__(self, sample_rate=SAMPLE_RATE):
-        self.sample_rate = sample_rate
-        self.waveform = 'sine'
-        self.frequency = 440.0
-        self._phase = 0.0
-        self.coarse_tune = 0
-        self.fine_tune = 0.0
+# UPDATED URL: Using 127.0.0.1 is more reliable than localhost
+# We keep '/v1' because the OpenAI library expects this structure.
+LM_STUDIO_URL = "http://127.0.0.1:1234/v1"
 
-    def set_midi_note(self, midi_note):
-        tuned_note = midi_note + self.coarse_tune + self.fine_tune
-        self.frequency = 440.0 * (2.0**((tuned_note - 69.0) / 12.0))
-        
-    def generate_block(self, num_samples=BLOCK_SIZE):
-        time_vector = np.arange(num_samples) / self.sample_rate
-        phase_increment = 2.0 * np.pi * self.frequency * time_vector
-        
-        phase_total = phase_increment + self._phase
-        self._phase = phase_total[-1] % (2.0 * np.pi)
-        
-        if self.waveform == 'sine':
-            audio_block = np.sin(phase_total)
-        elif self.waveform == 'square':
-            audio_block = np.sign(np.sin(phase_total))
-        elif self.waveform == 'sawtooth':
-            audio_block = ((phase_total % (2.0 * np.pi)) / (2.0 * np.pi)) * 2.0 - 1.0
-        elif self.waveform == 'triangle':
-            audio_block = (2/np.pi) * np.arcsin(np.sin(phase_total))
-        else:
-            audio_block = np.sin(phase_total)
-            
-        return audio_block
+# Standard 16th note length (before swing)
+BASE_STEP_SAMPLES = int((60.0 / BPM / 4.0) * SAMPLE_RATE)
 
-class ADSR:
-    def __init__(self, sample_rate=SAMPLE_RATE):
-        self.sample_rate = sample_rate
-        self.A, self.D, self.S, self.R = 0.1, 0.1, 0.7, 0.5 
-        
-        self.state = 'idle'
-        self._level = 0.0
-        self._time = 0.0
-        self._sustain_level = 0.0
-
-    def note_on(self, global_params):
-        self.A = global_params.get('attack', 0.1)
-        self.D = global_params.get('decay', 0.1)
-        self.S = global_params.get('sustain', 0.7)
-        self.R = global_params.get('release', 0.5)
-        
-        self.state = 'attack'
-        self._time = 0.0
-        
-    def note_off(self):
-        if self.state != 'idle':
-            self.state = 'release'
-            self._time = 0.0
-
-    def process_block(self, num_samples=BLOCK_SIZE):
-        gain_block = np.zeros(num_samples)
-        dt = 1.0 / self.sample_rate
-        
-        current_level = self._level
-        
-        for i in range(num_samples):
-            if self.state == 'attack':
-                if self.A > 0:
-                    current_level += dt / self.A
-                if current_level >= 1.0:
-                    current_level = 1.0
-                    self.state = 'decay'
-                    self._time = 0.0
-            
-            elif self.state == 'decay':
-                if self.D > 0 and current_level > self.S:
-                    current_level -= ((1.0 - self.S) * dt) / self.D
-                if current_level <= self.S:
-                    current_level = self.S
-                    self.state = 'sustain'
-
-            elif self.state == 'sustain':
-                current_level = self.S
-
-            elif self.state == 'release':
-                if self.R > 0:
-                    current_level -= (self._sustain_level * dt) / self.R
-                if current_level <= 0.0:
-                    current_level = 0.0
-                    self.state = 'idle'
-            
-            gain_block[i] = current_level
-            self._time += dt
-            self._level = current_level
-            
-            if self.state != 'release':
-                 self._sustain_level = current_level 
-
-        return gain_block
-
-class VCF:
-    def __init__(self, sample_rate=SAMPLE_RATE):
-        self.sample_rate = sample_rate
-        self.cutoff = 20000.0
-        self.resonance = 0.0
-        self._y1 = 0.0
-
-    def process_block(self, audio_in):
-        tau = 1.0 / (2.0 * np.pi * self.cutoff)
-        alpha = (self.sample_rate * tau) / (1.0 + self.sample_rate * tau)
-        
-        audio_out = np.zeros_like(audio_in)
-        
-        for i in range(len(audio_in)):
-            audio_out[i] = alpha * audio_in[i] + (1.0 - alpha) * self._y1
-            self._y1 = audio_out[i]
-            
-        return audio_out
-
-class Voice:
-    def __init__(self, midi_note, synth_settings):
-        self.vco = VCO(SAMPLE_RATE)
-        self.amp_env = ADSR(SAMPLE_RATE)
-        self.vco.set_midi_note(midi_note)
-        self.amp_env.note_on(synth_settings)
-
-    def generate_block(self, num_samples):
-        osc_out = self.vco.generate_block(num_samples)
-        amp_gain = self.amp_env.process_block(num_samples)
-        
-        is_finished = (self.amp_env.state == 'idle')
-        
-        return osc_out * amp_gain, is_finished
-
-# --- 3. MAIN SYNTHESIZER ENGINE ---
-class ClaritySynthesizer:
+# --- 2. HUMAN TIMING ENGINE (GROOVE) ---
+class HumanClock:
     def __init__(self):
+        self.sys_random = secrets.SystemRandom()
+        # 0.15 = 15% Swing (Classic "MPC 3000" feel)
+        self.swing_amount = 0.15 
+
+    def get_step_length(self, step_index):
+        """
+        Calculates sample duration for a specific 16th note step.
+        Applies Swing (Long-Short-Long-Short) + Micro-Jitter.
+        """
+        # SWING LOGIC
+        # Even steps (0, 2, 4...) -> Longer ("On" beat)
+        # Odd steps (1, 3, 5...) -> Shorter ("Off" beat)
+        if step_index % 2 == 0:
+            swing_offset = int(BASE_STEP_SAMPLES * self.swing_amount)
+        else:
+            swing_offset = -int(BASE_STEP_SAMPLES * self.swing_amount)
+            
+        # MICRO-JITTER (Human Imperfection)
+        # +/- 40 samples is ~1ms. Just enough to feel "loose".
+        jitter = self.sys_random.randint(-40, 40)
         
-        self.MAX_POLYPHONY = 8
-        self.voice_lock = threading.Lock()
+        return BASE_STEP_SAMPLES + swing_offset + jitter
+
+# --- 3. DYNAMIC DRUM MODULE (ROUND ROBIN) ---
+class HumanDrumModule:
+    def __init__(self):
+        print(">>> Synthesizing Drum Variations (Round Robin)...")
+        # Generate 4 slight variations of the Kick
+        self.kicks = [self._make_kick() for _ in range(4)]
+        # Generate 8 distinct variations of the Snare
+        self.snares = [self._make_snare() for _ in range(8)]
+
+    def _make_kick(self):
+        # Kick: Sine sweep
+        decay_var = np.random.uniform(14, 16) # Subtle timbre shift
+        t = np.linspace(0, 0.3, int(SAMPLE_RATE * 0.3))
+        freq = 150 * np.exp(-decay_var * t) + 40
+        audio = np.sin(2 * np.pi * np.cumsum(freq) / SAMPLE_RATE)
+        # Punchy envelope
+        return (audio * np.exp(-6 * t) * 0.9).astype(np.float32)
+
+    def _make_snare(self):
+        # Snare: Noise + Tone
+        t = np.linspace(0, 0.25, int(SAMPLE_RATE * 0.25))
+        # New random noise seed for every snare = organic sound
+        noise = np.random.uniform(-1, 1, len(t)) 
+        # Slight pitch variation in the "body" of the snare
+        tone_freq = np.random.uniform(175, 185)
+        tone = np.sin(2 * np.pi * tone_freq * t) * 0.3
+        return ((noise * 0.6 + tone) * np.exp(-12 * t) * 0.6).astype(np.float32)
+
+    def get_kick(self):
+        return secrets.choice(self.kicks)
+
+    def get_snare(self):
+        return secrets.choice(self.snares)
+
+# --- 4. SYNTHESIS MODULE ---
+class SynthModule:
+    def render_note(self, midi_note, duration_samples, params, type="bass"):
+        freq = 440.0 * (2.0**((midi_note - 69.0) / 12.0))
+        t = np.arange(duration_samples) / SAMPLE_RATE
         
-        self.active_voices = {}
-        self.global_vcf = VCF(SAMPLE_RATE)
-        self.is_running = True
+        # OSCILLATOR
+        if type == "bass": 
+            # Sawtooth (Aggressive)
+            osc = ((t * freq) % 1.0) * 2.0 - 1.0
+        else: 
+            # Triangle (Hollow/Eerie)
+            osc = (2/np.pi) * np.arcsin(np.sin(2 * np.pi * freq * t))
+            # Add simple vibrato to lead
+            vibrato = np.sin(2 * np.pi * 5.0 * t) * 0.005
+            osc = (2/np.pi) * np.arcsin(np.sin(2 * np.pi * freq * (t + vibrato)))
+            
+        # ENVELOPE (ADSR)
+        env = np.zeros(duration_samples)
+        attack_len = int(params.get('attack', 0.01) * SAMPLE_RATE)
+        decay_len = int(params.get('decay', 0.1) * SAMPLE_RATE)
+        sustain_lvl = params.get('sustain', 0.5)
         
-        # ### NEW: Recording State
-        self.is_recording = False
-        self.record_buffer = [] # Stores numpy blocks
+        # Safety checks for short notes
+        if attack_len >= duration_samples: 
+            attack_len = duration_samples
+            decay_len = 0
+        elif attack_len + decay_len > duration_samples:
+            decay_len = duration_samples - attack_len
+            
+        env[:attack_len] = np.linspace(0, 1, attack_len)
+        if decay_len > 0:
+            env[attack_len:attack_len+decay_len] = np.linspace(1, sustain_lvl, decay_len)
+            env[attack_len+decay_len:] = sustain_lvl
+            
+        # Release fade
+        release_len = min(500, duration_samples)
+        env[-release_len:] *= np.linspace(1, 0, release_len)
+
+        return osc * env
+
+# --- 5. THE AI STUDIO RENDERER ---
+class StudioRenderer:
+    def __init__(self):
+        # Using the updated URL
+        self.client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+        self.clock = HumanClock()
+        self.drums = HumanDrumModule()
+        self.synth = SynthModule()
+        self.history = collections.deque(maxlen=4)
+        self.song_buffer = []
+
+    def get_ai_bar(self, bar_idx):
+        """Query Llama 3 for the next bar's composition"""
+        prompt = (
+            "You are a Cyberpunk Music Composer. Output JSON ONLY.\n"
+            "Create a 16-step pattern. Use a dark, driving progression.\n"
+            "Format: {"
+            "\"root\":\"C2\", "
+            "\"kick\":\"x---x---x---x---\", "
+            "\"snare\":\"----x-------x---\", "
+            "\"bass_pat\":\"x-x-x-x-x-x-x-x-\", "
+            "\"lead_note\":\"G4\", "
+            "\"lead_pat\":\"-------x-------x\", "
+            "\"cutoff\": 2000"
+            "}\n"
+            f"Context: Bar {bar_idx + 1} of {BARS_TO_RENDER}. Intensity: High."
+        )
         
-        self.params = {
-            'master_volume': MAX_GAIN,
-            'waveform': 'sine',
-            'coarse_tune': 0,
-            'fine_tune': 0.0,
-            'cutoff': 10000.0,
-            'resonance': 0.0,
-            'attack': 0.1,
-            'decay': 0.1,
-            'sustain': 0.7,
-            'release': 0.5,
+        try:
+            print(f"-> AI Thinking (Bar {bar_idx+1})...")
+            resp = self.client.chat.completions.create(
+                model="model-identifier",
+                messages=[{"role": "system", "content": prompt}],
+                temperature=0.9, max_tokens=350, stop=["}"]
+            )
+            raw = resp.choices[0].message.content
+            if "}" not in raw: raw += "}"
+            json_str = raw[raw.find('{'):raw.rfind('}')+1]
+            data = json.loads(json_str)
+            self.history.append(data.get("root", "C2"))
+            return data
+        except Exception as e:
+            print(f"AI Glitch ({e}). Using backup pattern.")
+            return {
+                "root": "C2", "kick": "x---x---x---x---", "snare": "----x-------x---",
+                "bass_pat": "xxxxxxxxxxxxxxxx", "lead_pat": "----------------", "cutoff": 1500
+            }
+
+    def render_song(self):
+        print(f"/// INITIALIZING RENDER: {BARS_TO_RENDER} BARS @ {BPM} BPM ///")
+        print(f"/// TARGETING: {LM_STUDIO_URL} ///")
+        
+        note_map = {
+            'C2':36, 'C#2':37, 'D2':38, 'D#2':39, 'E2':40, 'F2':41, 'F#2':42, 'G2':43, 'A2':45, 
+            'C3':48, 'C4':60, 'G4':67, 'C5':72, 'F4':65, 'Bb4':70
         }
         
-        p = pyaudio.PyAudio()
-        self.stream = p.open(
-            format=pyaudio.paFloat32,
-            channels=1,
-            rate=SAMPLE_RATE,
-            output=True,
-            frames_per_buffer=BLOCK_SIZE,
-            stream_callback=self._audio_callback
-        )
-        print("Clarity Synthesizer Audio Stream Active.")
+        # Filter State
+        filter_y1 = 0.0
 
-    def note_on(self, midi_note):
-        with self.voice_lock: 
-            if midi_note not in self.active_voices:
-                if len(self.active_voices) >= self.MAX_POLYPHONY:
-                    return
-
-                new_voice = Voice(midi_note, self.params)
-                new_voice.vco.waveform = self.params['waveform']
-                new_voice.vco.coarse_tune = self.params['coarse_tune']
-                new_voice.vco.fine_tune = self.params['fine_tune']
-                self.active_voices[midi_note] = new_voice
-
-    def note_off(self, midi_note):
-        with self.voice_lock:
-            if midi_note in self.active_voices:
-                self.active_voices[midi_note].amp_env.note_off()
-
-    def update_param(self, name, value):
-        if name in ['coarse_tune']:
-            value = int(value)
-        elif name in ['cutoff']:
-            value = float(value)
-        
-        self.params[name] = value
-        
-        if name == 'cutoff':
-            self.global_vcf.cutoff = value
-        
-        if name in ['waveform', 'coarse_tune', 'fine_tune']:
-            for midi_note, voice in self.active_voices.items():
-                setattr(voice.vco, name, value)
-                if name in ['coarse_tune', 'fine_tune']:
-                     voice.vco.set_midi_note(midi_note)
-
-    # ### NEW: Recording Controls
-    def start_recording(self):
-        self.record_buffer = []
-        self.is_recording = True
-        print("Recording Started...")
-
-    def stop_recording(self):
-        self.is_recording = False
-        print(f"Recording Stopped. Captured {len(self.record_buffer)} blocks.")
-    
-    def save_recording(self, filename):
-        if not self.record_buffer:
-            return False
+        for bar_idx in range(BARS_TO_RENDER):
+            data = self.get_ai_bar(bar_idx)
             
-        try:
-            # Combine all numpy blocks into one large array
-            full_audio = np.concatenate(self.record_buffer)
+            # Parse Parameters
+            kick_pat = data.get('kick', '')
+            snare_pat = data.get('snare', '')
+            bass_pat = data.get('bass_pat', '')
+            lead_pat = data.get('lead_pat', '')
             
-            # Convert 32-bit float (-1.0 to 1.0) to 16-bit PCM integer (-32767 to 32767)
-            # This ensures compatibility with all standard media players
-            audio_int16 = (full_audio * 32767).clip(-32767, 32767).astype(np.int16)
-            
-            with wave.open(filename, 'wb') as wf:
-                wf.setnchannels(1) # Mono
-                wf.setsampwidth(2) # 2 bytes = 16 bit
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(audio_int16.tobytes())
-            return True
-        except Exception as e:
-            print(f"Error saving file: {e}")
-            return False
+            root = note_map.get(data.get('root', 'C2'), 36)
+            lead_note = note_map.get(data.get('lead_note', 'G4'), 67)
+            cutoff = float(data.get('cutoff', 2000))
 
-    def _audio_callback(self, in_data, frame_count, time_info, status):
-        output_block = np.zeros(frame_count, dtype=np.float32)
-        voices_to_remove = []
-        
-        with self.voice_lock:
-            active_items = list(self.active_voices.items())
-        
-        for midi_note, voice in active_items:
-            voice_output, is_finished = voice.generate_block(frame_count)
-            output_block += voice_output
-            
-            if is_finished:
-                voices_to_remove.append(midi_note)
-
-        with self.voice_lock:
-            for midi_note in voices_to_remove:
-                if midi_note in self.active_voices:
-                    del self.active_voices[midi_note]
-        
-        output_block = self.global_vcf.process_block(output_block)
-
-        master_gain = self.params.get('master_volume', MAX_GAIN)
-        output_block = np.clip(output_block, -1.0, 1.0) * master_gain
-        
-        # ### NEW: Capture audio if recording
-        # We capture the float array before conversion to bytes for processing
-        if self.is_recording:
-            self.record_buffer.append(output_block.copy())
-
-        return (output_block.astype(np.float32).tobytes(), pyaudio.paContinue)
-
-    def close(self):
-        self.stream.stop_stream()
-        self.stream.close()
-        p = pyaudio.PyAudio()
-        p.terminate()
-
-# --- 4. ACCESSIBLE TKINTER UI (SCROLL FUNCTION ADDED) ---
-
-class ClarityUI(tk.Tk):
-    """The main tkinter application with VI-First accessibility."""
-    
-    def __init__(self, synth):
-        super().__init__()
-        self.synth = synth
-        self.title("Clarity VI-First Synthesizer")
-        
-        # Set large window size
-        self.geometry("900x1400") 
-        
-        # --- High-Contrast & Font Setup ---
-        self.configure(bg='black')
-        LARGE_FONT = ('Arial', 28)
-        
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('TLabel', background='black', foreground='white', font=LARGE_FONT)
-        style.configure('TFrame', background='black')
-        style.configure('TScale', background='black', foreground='white', troughcolor='#333333')
-        style.configure('TButton', background='#333333', foreground='white', font=LARGE_FONT, borderwidth=5)
-        style.configure('TMenubutton', background='black', foreground='white', font=LARGE_FONT)
-
-        style.configure('Focused.TScale', background='black', foreground='white', troughcolor='yellow')
-        
-        # Styles for Record Button
-        style.configure('Record.TButton', foreground='red', background='#220000')
-        style.configure('Stop.TButton', foreground='yellow', background='#222200')
-
-        # ------------------------------------------------------------------
-        # SCROLLING IMPLEMENTATION
-        # ------------------------------------------------------------------
-        
-        canvas = tk.Canvas(self, bg='black', highlightthickness=0)
-        canvas.pack(side="left", fill="both", expand=True)
-
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        scrollbar.pack(side="right", fill="y")
-
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        scrollable_frame = ttk.Frame(canvas, padding="30 30 30 30")
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(
-                scrollregion=canvas.bbox("all")
-            )
-        )
-        scrollable_frame.bind("<MouseWheel>", self._on_mousewheel) 
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        
-        scrollable_frame.bind(
-            "<Enter>",
-            lambda e: canvas.bind_all('<Key-Down>', self._on_arrow_key_scroll),
-        )
-        scrollable_frame.bind(
-            "<Leave>",
-            lambda e: canvas.unbind_all('<Key-Down>'),
-        )
-
-        # --- Keyboard Bindings ---
-        self.bind_all('<KeyPress>', self._handle_key_press)
-        self.bind_all('<KeyRelease>', self._handle_key_release)
-        self.pressed_keys = set()
-
-        # --- Build Layout ---
-        self._row_counter = 0
-
-        # Master Section
-        self._add_section_header(scrollable_frame, "Master Controls")
-        
-        # ### NEW: Add Record Button in Master Section
-        self._add_record_controls(scrollable_frame)
-        
-        self._add_scale_control(scrollable_frame, "master_volume", "Volume", 0.0, MAX_GAIN, MAX_GAIN, 0.01)
-
-        # VCO Section
-        self._add_section_header(scrollable_frame, "VCO (Oscillator)")
-        self._add_dropdown_control(scrollable_frame, "waveform", "Waveform", ['sine', 'square', 'sawtooth', 'triangle'])
-        self._add_scale_control(scrollable_frame, "coarse_tune", "Coarse Tune (Semi)", -12, 12, 0, 1)
-        self._add_scale_control(scrollable_frame, "fine_tune", "Fine Tune (Cents)", -1.0, 1.0, 0.0, 0.01)
-
-        # VCF Section
-        self._add_section_header(scrollable_frame, "VCF (Filter)")
-        self._add_scale_control(scrollable_frame, "cutoff", "Cutoff Freq (Hz)", 20, 20000, 10000, 1)
-        self._add_scale_control(scrollable_frame, "resonance", "Resonance (Q)", 0.0, 1.0, 0.0, 0.01, state=tk.DISABLED)
-
-        # ADSR Section
-        self._add_section_header(scrollable_frame, "ADSR (Envelope)")
-        self._add_scale_control(scrollable_frame, "attack", "Attack (s)", 0.001, 5.0, 0.1, 0.01)
-        self._add_scale_control(scrollable_frame, "decay", "Decay (s)", 0.001, 5.0, 0.1, 0.01)
-        self._add_scale_control(scrollable_frame, "sustain", "Sustain (Level)", 0.0, 1.0, 0.7, 0.01)
-        self._add_scale_control(scrollable_frame, "release", "Release (s)", 0.001, 5.0, 0.5, 0.01)
-        
-        # --- Final Instructions Label ---
-        ttk.Label(scrollable_frame, text="Note Keys: A S D F G... | Navigation: TAB/Arrows", 
-                  background='#0000FF', foreground='white', font=('Arial', 28, 'bold')).grid(
-                      row=self._row_counter, column=0, columnspan=2, pady=30, sticky='ew')
-        self._row_counter += 1
-        
-        self.canvas = canvas 
-
-    # ### NEW: Record Button Helper
-    def _add_record_controls(self, parent):
-        self.record_btn_var = tk.StringVar(value="RECORD")
-        
-        self.record_btn = ttk.Button(
-            parent, 
-            textvariable=self.record_btn_var, 
-            command=self._toggle_record,
-            style='Record.TButton'
-        )
-        self.record_btn.grid(row=self._row_counter, column=0, columnspan=2, sticky='ew', padx=15, pady=20)
-        self._row_counter += 1
-
-    # ### NEW: Record Toggle Logic
-    def _toggle_record(self):
-        if not self.synth.is_recording:
-            # Start Recording
-            self.synth.start_recording()
-            self.record_btn_var.set("STOP & SAVE")
-            self.record_btn.configure(style='Stop.TButton')
-            print("Announcement: Recording started.")
-        else:
-            # Stop Recording
-            self.synth.stop_recording()
-            self.record_btn_var.set("RECORD")
-            self.record_btn.configure(style='Record.TButton')
-            
-            # Open File Dialog
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".wav",
-                filetypes=[("WAV files", "*.wav")],
-                title="Save Recording"
-            )
-            
-            if filename:
-                success = self.synth.save_recording(filename)
-                if success:
-                    print(f"Announcement: Saved to {filename}")
+            # RENDER 16 STEPS
+            for step in range(16):
+                # 1. TIMING: Get Swing-adjusted length
+                step_len = self.clock.get_step_length(step)
+                mix_chunk = np.zeros(step_len)
+                
+                # 2. DYNAMICS: Determine Velocity
+                if step % 4 == 0:
+                    velocity = np.random.uniform(0.95, 1.0)
                 else:
-                    print("Announcement: Error saving file.")
-            else:
-                print("Announcement: Save cancelled.")
+                    velocity = np.random.uniform(0.75, 0.9)
 
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+                # 3. DRUMS
+                if step < len(kick_pat) and kick_pat[step] in 'xX':
+                    sample = self.drums.get_kick()
+                    slen = min(step_len, len(sample))
+                    mix_chunk[:slen] += sample[:slen] * velocity
+
+                if step < len(snare_pat) and snare_pat[step] in 'xX':
+                    sample = self.drums.get_snare()
+                    slen = min(step_len, len(sample))
+                    mix_chunk[:slen] += sample[:slen] * velocity * 0.9
+
+                # 4. SYNTHS
+                synth_chunk = np.zeros(step_len)
+                
+                if step < len(bass_pat) and bass_pat[step] in 'xX':
+                    note = self.synth.render_note(root, step_len, 
+                           {'attack':0.01, 'decay':0.15, 'sustain':0.0}, "bass")
+                    synth_chunk += note * 0.6 * velocity
+
+                if step < len(lead_pat) and lead_pat[step] in 'xX':
+                    note = self.synth.render_note(lead_note, step_len, 
+                           {'attack':0.1, 'decay':0.4, 'sustain':0.4}, "lead")
+                    synth_chunk += note * 0.4 * velocity
+
+                # 5. FILTER
+                alpha = (2 * np.pi * cutoff / SAMPLE_RATE)
+                for i in range(step_len):
+                    filter_y1 = filter_y1 + alpha * (synth_chunk[i] - filter_y1)
+                    synth_chunk[i] = filter_y1
+                
+                mix_chunk += synth_chunk
+                self.song_buffer.append(mix_chunk)
+
+        self.save_wav()
+
+    def save_wav(self):
+        filename = f"HUMAN_AI_JAM_{datetime.datetime.now().strftime('%H%M%S')}.wav"
+        print(f"/// EXPORTING TO {filename} ...")
         
-    def _on_arrow_key_scroll(self, event):
-        if self.focus_get() == self.canvas:
-             self.canvas.yview_scroll(1, "units")
-
-    def _add_section_header(self, parent, text):
-        ttk.Label(parent, text=f"--- {text} ---", foreground='yellow', font=('Arial', 32, 'bold')).grid(
-            row=self._row_counter, column=0, columnspan=2, pady=(35, 15), sticky='w')
-        self._row_counter += 1
-
-    def _add_scale_control(self, parent, param_name, label_text, from_val, to_val, default_val, resolution, state=tk.NORMAL):
-        label = ttk.Label(parent, text=label_text + ":", anchor='w')
-        label.grid(row=self._row_counter, column=0, sticky='w', padx=15, pady=8)
-
-        current_value = tk.DoubleVar(value=default_val)
+        full_audio = np.concatenate(self.song_buffer)
         
-        def update_synth(value):
-            self.synth.update_param(param_name, float(value))
-            print(f"Announcement: {label_text}, Value: {float(value):.2f}") 
-
-        scale = ttk.Scale(parent, from_=from_val, to=to_val, orient=tk.HORIZONTAL, 
-                          command=update_synth, variable=current_value, 
-                          length=550, style='TScale', state=state, 
-                          value=default_val, 
-                          takefocus=1, 
-                          cursor='hand2',
-                          )
-        scale.grid(row=self._row_counter, column=1, sticky='ew', padx=15, pady=8)
+        # LIMITER
+        max_val = np.max(np.abs(full_audio))
+        if max_val > 0:
+            full_audio = full_audio / max_val * 0.95
+            
+        int_audio = (full_audio * 32767).astype(np.int16)
         
-        scale.bind('<FocusIn>', lambda event: scale.configure(style='Focused.TScale'))
-        scale.bind('<FocusOut>', lambda event: scale.configure(style='TScale'))
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1) 
+            wf.setsampwidth(2) 
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(int_audio.tobytes())
+            
+        print(f"/// DONE. PLAY {filename} ///")
 
-        self.synth.update_param(param_name, default_val)
-        self._row_counter += 1
-
-    def _add_dropdown_control(self, parent, param_name, label_text, options):
-        label = ttk.Label(parent, text=label_text + ":", anchor='w')
-        label.grid(row=self._row_counter, column=0, sticky='w', padx=15, pady=8)
-        
-        default_val = options[0]
-        current_value = tk.StringVar(value=default_val)
-        
-        def update_synth(value):
-            self.synth.update_param(param_name, value)
-            print(f"Announcement: {label_text}, Set to: {value}")
-
-        menu = OptionMenu(parent, current_value, default_val, *options, command=update_synth)
-        menu.configure(bg='black', fg='white', font=('Arial', 28), takefocus=1)
-        menu.grid(row=self._row_counter, column=1, sticky='ew', padx=15, pady=8)
-
-        self.synth.update_param(param_name, default_val)
-        self._row_counter += 1
-
-    def _handle_key_press(self, event):
-        key = event.keysym.lower()
-        if key in KEY_MAP:
-            midi_note = KEY_MAP[key]
-            if key not in self.pressed_keys:
-                self.synth.note_on(midi_note)
-                print(f"Note On: {key} (MIDI {midi_note})")
-                self.pressed_keys.add(key)
-        
-        if event.keysym == 'Return' and self.focus_get():
-            try:
-                widget = self.focus_get()
-                if isinstance(widget, ttk.Scale):
-                    widget_info = widget.grid_info()
-                    parent = widget.master
-                    label_text = parent.grid_slaves(row=widget_info['row'], column=0)[0].cget('text').replace(':', '')
-                    print(f"Screen Read: {label_text} slider focused. Current Value: {widget.get():.2f}")
-                elif isinstance(widget, OptionMenu):
-                    print(f"Screen Read: Dropdown focused. Current Selection: {widget.cget('text')}")
-            except Exception:
-                pass
-
-    def _handle_key_release(self, event):
-        key = event.keysym.lower()
-        if key in KEY_MAP:
-            midi_note = KEY_MAP[key]
-            self.synth.note_off(midi_note)
-            print(f"Note Off: {key} (MIDI {midi_note})")
-            if key in self.pressed_keys:
-                self.pressed_keys.remove(key)
-
-# --- 5. MAIN EXECUTION ---
-if __name__ == '__main__':
-    synth = ClaritySynthesizer()
-    app = ClarityUI(synth)
-    
-    try:
-        app.mainloop()
-    except tk.TclError as e:
-        print(f"Tkinter error during mainloop: {e}")
-    finally:
-        synth.close()
-        print("\nClarity Synthesizer shut down successfully.")
+if __name__ == "__main__":
+    studio = StudioRenderer()
+    studio.render_song()
