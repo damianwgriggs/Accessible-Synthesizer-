@@ -7,18 +7,40 @@ import datetime
 import random
 from openai import OpenAI
 
-# --- 1. GLOBAL STUDIO CONFIG ---
+# --- 1. STUDIO CONFIG ---
 SAMPLE_RATE = 44100
-BPM = 94
-TOTAL_BARS = 36 # 1:30 song
+BPM = 86
+TOTAL_BARS = 48 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1"
 BASE_STEP_SAMPLES = int((60.0 / BPM / 4.0) * SAMPLE_RATE)
 
-# --- 2. TIMING: THE SWING ---
-class PlatinumClock:
+# --- 2. THE HUMANIZER (NEW) ---
+class PersonalityEngine:
+    def __init__(self):
+        # Offsets in milliseconds (Negative = Rush, Positive = Drag)
+        self.offsets = {
+            'kick': 0,        # The Anchor
+            'snare': 15,      # Lazy, dragging snare (Dilla style)
+            'hat': -5,        # Rushing hats (Urgency)
+            'bass': 20,       # Bassist playing waaaay back in the pocket
+            'keys': -10,      # Eager keys
+            'lead': 5
+        }
+    
+    def get_start_index(self, cursor, inst_type):
+        # Convert ms to samples
+        ms_offset = self.offsets.get(inst_type, 0)
+        # Add random "human error" per note (+/- 4ms)
+        human_error = random.randint(-176, 176) 
+        total_offset_samples = int((ms_offset / 1000.0) * SAMPLE_RATE) + human_error
+        
+        return cursor + total_offset_samples
+
+# --- 3. CLOCK ---
+class JamClock:
     def __init__(self):
         self.sys_random = secrets.SystemRandom()
-        self.swing_amount = 0.22 
+        self.swing_amount = 0.28 
 
     def get_step_length(self, step_index):
         if step_index % 2 == 0:
@@ -28,195 +50,186 @@ class PlatinumClock:
         jitter = self.sys_random.randint(-100, 100) 
         return BASE_STEP_SAMPLES + swing_offset + jitter
 
-# --- 3. DRUMS: LAYERED KITS ---
-class LayeredDrumModule:
+# --- 4. DRUMS ---
+class StonerDrums:
     def __init__(self):
-        print(">>> Loading Sample Packs...")
+        print(">>> Tuning Skins...")
         self.kicks = [self._make_kick() for _ in range(5)]
         self.snares = [self._make_snare() for _ in range(5)]
         self.hats = [self._make_hat() for _ in range(4)]
-        self.crash = self._make_crash() 
 
     def _make_kick(self):
-        t = np.linspace(0, 0.5, int(SAMPLE_RATE * 0.5))
-        freq = 110 * np.exp(-15 * t) + 30
+        t = np.linspace(0, 0.4, int(SAMPLE_RATE * 0.4))
+        freq = 90 * np.exp(-10 * t) + 40
         audio = np.sin(2 * np.pi * np.cumsum(freq) / SAMPLE_RATE)
-        return np.tanh(audio * 3.0).astype(np.float32)
+        return (np.tanh(audio * 1.5) * np.exp(-4 * t)).astype(np.float32)
 
     def _make_snare(self):
-        t = np.linspace(0, 0.25, int(SAMPLE_RATE * 0.25))
-        noise = np.random.uniform(-1, 1, len(t)) * np.exp(-12 * t)
-        tone = np.sin(2 * np.pi * 180 * t) * np.exp(-10 * t) * 0.3
-        return ((noise + tone) * 0.8).astype(np.float32)
+        t = np.linspace(0, 0.15, int(SAMPLE_RATE * 0.15))
+        tone = np.sin(2 * np.pi * 350 * t) * np.exp(-15 * t)
+        noise = np.random.uniform(-0.8, 0.8, len(t)) * np.exp(-20 * t)
+        return ((tone + noise) * 0.7).astype(np.float32)
 
     def _make_hat(self):
-        t = np.linspace(0, 0.05, int(SAMPLE_RATE * 0.05))
-        return (np.random.uniform(-0.5, 0.5, len(t)) * np.exp(-30 * t)).astype(np.float32)
-
-    def _make_crash(self):
-        t = np.linspace(0, 2.0, int(SAMPLE_RATE * 2.0))
-        noise = np.random.uniform(-0.4, 0.4, len(t))
-        return (noise * np.exp(-2 * t)).astype(np.float32)
+        t = np.linspace(0, 0.06, int(SAMPLE_RATE * 0.06))
+        return (np.random.uniform(-0.4, 0.4, len(t)) * np.exp(-15 * t)).astype(np.float32)
 
     def get_kick(self): return secrets.choice(self.kicks)
     def get_snare(self): return secrets.choice(self.snares)
     def get_hat(self): return secrets.choice(self.hats)
 
-# --- 4. INSTRUMENTS: THE FULL BAND ---
-class MultiSynth:
+# --- 5. SYNTHS ---
+class JamSynth:
     def render(self, midi, duration, type="bass"):
         freq = 440.0 * (2.0**((midi - 69.0) / 12.0))
-        t = np.arange(duration) / SAMPLE_RATE
+        # RANDOMIZE DURATION (Staccato vs Legato)
+        # Musicians don't hold notes for exact grid time
+        human_duration = int(duration * random.uniform(0.8, 1.1))
+        t = np.arange(human_duration) / SAMPLE_RATE
+        
+        detune = random.uniform(0.995, 1.005)
         
         if type == "bass":
-            osc1 = ((t * freq) % 1.0) * 2.0 - 1.0 
-            osc2 = np.sin(2 * np.pi * (freq * 0.5) * t) 
-            raw = osc1 * 0.6 + osc2 * 0.8 
-            raw = np.convolve(raw, np.ones(10)/10, mode='same')
-            return np.tanh(raw * 2.0) * 0.8
+            osc = ((t * freq * detune) % 1.0) * 2.0 - 1.0
+            env = np.exp(-8 * t)
+            osc = np.convolve(osc, np.ones(5)/5, mode='same')
+            return osc * env * 0.8
+
+        elif type == "keys":
+            raw = np.sin(2 * np.pi * freq * t)
+            lfo = np.sin(2 * np.pi * 3.0 * t)
+            return raw * (0.5 + 0.5 * lfo) * np.exp(-2 * t) * 0.5
 
         elif type == "lead":
-            mod = np.sin(2 * np.pi * 6.0 * t) * 0.005
-            return np.sin(2 * np.pi * freq * (t + mod)) * 0.5
+            glide = np.sin(2 * np.pi * 4.0 * t) * 0.005
+            return np.sin(2 * np.pi * freq * (t + glide)) * 0.4
 
-        elif type == "pad":
-            osc1 = ((t * freq) % 1.0) * 2.0 - 1.0
-            osc2 = ((t * freq * 1.01) % 1.0) * 2.0 - 1.0
-            osc3 = ((t * freq * 0.99) % 1.0) * 2.0 - 1.0
-            raw = (osc1 + osc2 + osc3) * 0.3
-            att = int(0.3 * SAMPLE_RATE)
-            if att < len(raw): raw[:att] *= np.linspace(0, 1, att)
-            return raw * 0.3 
+        return np.zeros(human_duration)
 
-        elif type == "pluck":
-            mod_freq = freq * 2.5
-            mod = np.sin(2 * np.pi * mod_freq * t) * np.exp(-10 * t) * 2.0
-            carrier = np.sin(2 * np.pi * freq * t + mod)
-            return carrier * np.exp(-8 * t) * 0.4
-
-        return np.zeros(duration)
-
-# --- 5. THE PRODUCER (AI BRAIN) ---
-class StudioProducer:
+# --- 6. PRODUCER ---
+class InfiniteJamProducer:
     def __init__(self):
         self.client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
-        self.clock = PlatinumClock()
-        self.drums = LayeredDrumModule()
-        self.synth = MultiSynth()
-        self.motif_bank = {} 
+        self.clock = JamClock()
+        self.personality = PersonalityEngine() # NEW
+        self.drums = StonerDrums()
+        self.synth = JamSynth()
+        self.history = collections.deque(maxlen=7) 
 
-    def get_structure(self, bar):
-        if bar < 4: return "INTRO"
-        if bar < 20: return "VERSE"
-        if bar < 28: return "HOOK"
-        return "OUTRO"
-
-    def get_pattern(self, bar):
-        section = self.get_structure(bar)
-        
-        if section == "HOOK" and "hook_pat" in self.motif_bank:
-            return self.motif_bank["hook_pat"]
+    def get_next_bar_improv(self, bar_num):
+        context = "Start."
+        if self.history:
+            context = "->".join([h.get('root', 'C2') for h in self.history])
 
         prompt = (
-            f"Role: Hip Hop Producer. Section: {section}. BPM: {BPM}.\n"
-            "Output JSON ONLY. Create a 1-bar loop.\n"
-            "Format: {\"root\":\"C2\", \"kick\":\"x...\", \"snare\":\"...\", \"bass\":\"x...\", \"pad_chord\":\"C3\", \"pluck_pat\":\"--x-\", \"lead_pat\":\"...\"}"
+            f"Genre: Stoner Funk. BPM: {BPM}. Bar: {bar_num}.\n"
+            "Output JSON ONLY. IMPROVISE.\n"
+            f"Context: {context}\n"
+            "Format: {\"root\":\"C2\", \"kick\":\"x...\", \"snare\":\"...\", \"bass\":\"x...\", \"keys_chord\":\"C3\", \"lead_pat\":\"...\"}"
         )
 
         try:
-            print(f"-> Composing Bar {bar+1} ({section})...")
+            print(f"-> Improvising Bar {bar_num+1}...")
             resp = self.client.chat.completions.create(
                 model="model-identifier",
                 messages=[{"role": "system", "content": prompt}],
-                temperature=0.9, max_tokens=400, stop=["}"]
+                temperature=1.1, 
+                max_tokens=400, stop=["}"]
             )
             raw = resp.choices[0].message.content
             if "}" not in raw: raw += "}"
             data = json.loads(raw[raw.find('{'):raw.rfind('}')+1])
-            
-            if section == "HOOK" and "hook_pat" not in self.motif_bank:
-                self.motif_bank["hook_pat"] = data
+            self.history.append(data)
             return data
         except:
-            return {"root":"C2", "kick":"x---", "snare":"----", "bass":"x---"}
+            return {"root":"C2", "kick":"x---x---", "snare":"----x---", "bass":"x-x-"}
+
+    def add_to_mix(self, mix, audio, start_idx):
+        """Safely add audio to mix handling array bounds"""
+        if start_idx < 0: start_idx = 0
+        if start_idx >= len(mix): return
+        
+        end_idx = start_idx + len(audio)
+        if end_idx > len(mix):
+            audio = audio[:len(mix)-start_idx]
+            end_idx = len(mix)
+            
+        mix[start_idx:end_idx] += audio
 
     def render(self):
-        print(f"/// RECORDING STUDIO SESSION ({TOTAL_BARS} BARS) ///")
-        full_len = int(TOTAL_BARS * 16 * BASE_STEP_SAMPLES * 1.05)
+        print(f"/// DE-QUANTIZED SESSION ({TOTAL_BARS} BARS) ///")
+        # Add extra buffer for delays/reverbs tail
+        full_len = int(TOTAL_BARS * 16 * BASE_STEP_SAMPLES * 1.1)
         track_mix = np.zeros(full_len)
         cursor = 0
         
-        note_map = {'C2':36, 'F2':41, 'G2':43, 'C3':48, 'G3':55, 'C4':60, 'G4':67, 'C5':72}
+        note_map = {'C2':36, 'Eb2':39, 'F2':41, 'G2':43, 'Bb2':46, 'C3':48, 'Eb3':51, 'G3':55, 'C4':60, 'G4':67, 'C5':72}
 
         for bar in range(TOTAL_BARS):
-            data = self.get_pattern(bar)
+            data = self.get_next_bar_improv(bar)
             
-            # --- ERROR FIX: HANDLE CHORDS AS LISTS ---
-            # If AI returns ["C3", "E3", "G3"], just take "C3"
-            raw_root = data.get('root', 'C2')
-            if isinstance(raw_root, list): raw_root = raw_root[0]
+            r_root = data.get('root', 'C2')
+            if isinstance(r_root, list): r_root = r_root[0]
+            r_keys = data.get('keys_chord', 'C3')
+            if isinstance(r_keys, list): r_keys = r_keys[0]
             
-            raw_pad = data.get('pad_chord', 'C3')
-            if isinstance(raw_pad, list): raw_pad = raw_pad[0]
-            
-            root = note_map.get(raw_root, 36)
-            pad_n = note_map.get(raw_pad, 48)
-            # -----------------------------------------
-            
-            # Crash Logic
-            if bar in [0, 4, 20, 28]:
-                c = self.drums.crash
-                cl = min(len(c), len(track_mix) - cursor)
-                track_mix[cursor:cursor+cl] += c[:cl] * 0.4
+            root = note_map.get(r_root, 36)
+            keys_n = note_map.get(r_keys, 48)
 
             for step in range(16):
                 step_len = self.clock.get_step_length(step)
                 
-                # DRUMS
+                # --- DRUMS (OFFSET APPLIED) ---
+                vel = random.uniform(0.8, 1.0)
+                
                 if step < len(data.get('kick','')) and data['kick'][step] in 'xX':
                     s = self.drums.get_kick()
-                    sl = min(len(s), len(track_mix) - cursor)
-                    track_mix[cursor:cursor+sl] += s[:sl]
-                
+                    # Personality: Kick is the anchor (0ms), but has human error
+                    start = self.personality.get_start_index(cursor, 'kick')
+                    self.add_to_mix(track_mix, s * vel, start)
+
                 if step < len(data.get('snare','')) and data['snare'][step] in 'xX':
                     s = self.drums.get_snare()
-                    sl = min(len(s), len(track_mix) - cursor)
-                    track_mix[cursor:cursor+sl] += s[:sl]
-                
-                if step % 2 == 0: 
-                    h = self.drums.get_hat()
-                    hl = min(len(h), len(track_mix) - cursor)
-                    track_mix[cursor:cursor+hl] += h[:hl] * 0.3
+                    # Personality: Snare is lazy (+15ms)
+                    start = self.personality.get_start_index(cursor, 'snare')
+                    self.add_to_mix(track_mix, s * vel, start)
 
-                # SYNTHS
+                if random.random() > 0.15: 
+                    h = self.drums.get_hat()
+                    # Personality: Hats are rushing (-5ms)
+                    start = self.personality.get_start_index(cursor, 'hat')
+                    self.add_to_mix(track_mix, h * 0.3, start)
+
+                # --- SYNTHS (OFFSET APPLIED) ---
                 if step < len(data.get('bass','')) and data['bass'][step] in 'xX':
                     b = self.synth.render(root, step_len * 2, "bass")
-                    sl = min(len(b), len(track_mix) - cursor)
-                    track_mix[cursor:cursor+sl] += b[:sl]
+                    # Personality: Bass drags huge (+20ms)
+                    start = self.personality.get_start_index(cursor, 'bass')
+                    self.add_to_mix(track_mix, b, start)
 
-                if step == 0: # Pad once per bar
-                    p = self.synth.render(pad_n, step_len * 16, "pad")
-                    sl = min(len(p), len(track_mix) - cursor)
-                    track_mix[cursor:cursor+sl] += p[:sl]
+                if step < len(data.get('keys_pat','')) and data['keys_pat'][step] in 'xX':
+                     k = self.synth.render(keys_n, step_len * 4, "keys")
+                     # Personality: Keys rush (-10ms)
+                     start = self.personality.get_start_index(cursor, 'keys')
+                     self.add_to_mix(track_mix, k, start)
+                elif step == 0 and random.random() > 0.4:
+                     k = self.synth.render(keys_n, step_len * 8, "keys")
+                     start = self.personality.get_start_index(cursor, 'keys')
+                     self.add_to_mix(track_mix, k, start)
 
                 if step < len(data.get('lead_pat','')) and data['lead_pat'][step] in 'xX':
                     l = self.synth.render(root + 24, step_len * 2, "lead") 
-                    sl = min(len(l), len(track_mix) - cursor)
-                    track_mix[cursor:cursor+sl] += l[:sl]
-
-                if step < len(data.get('pluck_pat','')) and data['pluck_pat'][step] in 'xX':
-                    pl = self.synth.render(root + 36, step_len, "pluck") 
-                    sl = min(len(pl), len(track_mix) - cursor)
-                    track_mix[cursor:cursor+sl] += pl[:sl]
+                    start = self.personality.get_start_index(cursor, 'lead')
+                    self.add_to_mix(track_mix, l, start)
 
                 cursor += step_len
 
         print("/// MASTERING... ///")
-        track_mix = np.tanh(track_mix * 1.2) 
+        track_mix = np.tanh(track_mix * 1.3) 
         mx = np.max(np.abs(track_mix))
         if mx > 0: track_mix = (track_mix / mx) * 0.95
         
-        fn = f"PLATINUM_HIT_{datetime.datetime.now().strftime('%H%M%S')}.wav"
+        fn = f"ORGANIC_JAM_{datetime.datetime.now().strftime('%H%M%S')}.wav"
         with wave.open(fn, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
@@ -225,6 +238,5 @@ class StudioProducer:
         print(f"/// DONE: {fn} ///")
 
 if __name__ == "__main__":
-    p = StudioProducer()
+    p = InfiniteJamProducer()
     p.render()
-    
